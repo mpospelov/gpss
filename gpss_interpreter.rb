@@ -13,6 +13,7 @@ class GPSS
       print_queues(gpss)
       print_storages(gpss)
       print_devices(gpss)
+      print_transacts(gpss)
       puts "1"
     end
 
@@ -43,10 +44,21 @@ class GPSS
       puts "\n"
     end
 
+    def print_transacts(gpss)
+      active_transacts = gpss.transacts.select{|t| t.live_time != 0 }
+      avg = active_transacts.inject(0){|s, t| s+=t.live_time }/active_transacts.count
+      max = active_transacts.max_by(&:live_time).live_time
+      min = active_transacts.min_by(&:live_time).live_time
+      table = Terminal::Table.new title: "Transacts(Active Count: #{active_transacts.count})", 
+        headings: [ "Average Live Time", "Max Live Time", "Min Live Time"], 
+        rows: [[avg.round(2), max.round(2), min.round(2)]]
+      puts table
+      puts "\n"
+    end
+
   end
 
   def initialize(timer, &block)
-    @simulation = Simulation.new
     @timer = timer
     @storages = {}
     @queues = {}
@@ -56,37 +68,64 @@ class GPSS
 
     @random_generators = {}
     @generators_finishes = {}
-    parser = CommandParser.new
+    parser = CommandParser.new(self)
     parser.parse(&block)
     @commands = parser.commands
+    @commands_count = @commands.length
+  end
+
+
+  def print_transacts_progress
+    @commands.each_with_index do |command,num|
+      transacts_count = @transacts.select{|t| t.current_command == num }.count
+      puts "#{num}.\t#{command[0]}:\t#{"."*transacts_count}"
+    end
+    puts "_________"
   end
 
   def run
     transacts_count = @transacts.length
     commands_length = @commands.length
-    @transacts << Transact.new(time: 0, command: 0)
-    current_time = 0
+    @transacts << Transact.new(
+      time: 0, 
+      command: 0, 
+      commands_count: @commands_count)
+
     while transact = next_transact
       command_number = transact.current_command
       command = @commands[command_number]
-      command_name = command[0]
-      command_args = command[1]
-      command_block = command[2]
 
       @queues.each do |name, q|
         @queues_sizes[name] ||= []
         @queues_sizes[name] << q.size
       end
-
-      send(command_name, transact, command_number, *command_args, &command_block)
+      exec(transact)
       transact.current_command += 1
     end
   end
 
+  def exec(transact)
+    pp transact
+    puts "\n"
+    print_transacts_progress
+    sleep 0.1
+
+    command_number = transact.current_command
+    command = @commands[command_number]
+    command_name = command[0]
+    command_args = command[1]
+    command_block = command[2]
+
+    send(command_name, transact, command_number, *command_args, &command_block)
+  end
+
   def next_transact
-    @transacts.sort_by!(&:current_time)
-    result = @transacts.first
-    if result.current_command != @commands.length
+    select_from = @transacts.select(&:not_finished?).sort_by(&:current_time)
+    result = select_from.detect(&:not_blocked?)
+    if !result.nil?
+      select_from.each do |transact|
+        transact.current_time = result.current_time if transact.blocked?
+      end
       result
     end
   end
@@ -106,7 +145,9 @@ class GPSS
         generator = @random_generators[name]
         value = generator.next
         current_time += value
-        @transacts << Transact.new(time: current_time, command: command_number)
+        @transacts << Transact.new(time: current_time, 
+          command: command_number + 1, 
+          commands_count: @commands_count)
       end
       @generators_finishes[name] = true
     end
@@ -128,10 +169,17 @@ class GPSS
   end
 
   def test_condition(transact, command_number, &block)
+    transact.add_blocker(block)
   end
 
   def enter(transact, command_number, name:)
-    @storages[name].enter
+    storage = @storages[name]
+    if storage.full?
+      blocker = lambda{ !storage.full? }
+      transact.add_blocker(blocker)
+    else
+      storage.enter
+    end
   end
 
   def depart(transact, command_number, name:)
@@ -139,28 +187,40 @@ class GPSS
   end
 
   def leave(transact, command_number, name:)
-    @storages[name].enter
+    @storages[name].leave
   end
 
   def seize(transact, command_number, name:)
     @devices[name] ||= Device.new
-    @devices[name].seize(transact)
+    device = @devices[name]
+    if device.work? 
+      blocker = lambda{ !device.work? }
+      transact.add_blocker(blocker)
+    else
+      device.seize
+    end
   end
 
   def release(transact, command_number, name:)
-    @devices[name].release(transact)
+    @devices[name].release
   end
 
   class CommandParser
 
     attr_accessor :commands
 
-    def initialize
+    def initialize(gpss)
       @commands = []
+      @gpss = gpss
     end
 
     def parse(&block)
       instance_eval(&block)
+    end
+
+    # RUNTIME METHODS
+    def get_queue(name)
+      @gpss.queues[name] || Queue.new
     end
 
     def method_missing(name, *args, &block)
@@ -170,58 +230,79 @@ class GPSS
   end
 
   class Device
-    attr_accessor :size, :max_size
+    attr_accessor :size, :max_size, :is_working
 
-    def initialize
-      @size, @max_size = 0, 0
+    def seize
+      @is_working = true
     end
 
-    def seize(transact)
-      @size += 1
-      @max_size = @size if @size > @max_size
+    def release
+      @is_working = false
     end
 
-    def release(transact)
-      @size -= 1
-    end
-
-  end
-
-  class Simulation
-
-    attr_accessor :current_events_chain, :future_events_chain
-
-    def initialize
-      @current_events_chain, @future_events_chain = [], []
-    end
-
-    def add_future_event(event)
-      @future_events_chain << event
+    def work?
+      @is_working
     end
 
   end
 
   class Transact
 
-    attr_accessor :current_time, :live_time, :current_command
+    attr_accessor :start_time, :live_time, :current_command, :commands_count, :index
 
     @@max_index = 0
 
-    def initialize(time:, command:)
+    def initialize(time:, command:, commands_count:)
+      @commands_count = commands_count
       @current_command = command
       @live_time = 0
       @index = @@max_index
       @@max_index += 1
-      @current_time = time
+      @start_time = time
+      @blockers = []
     end
 
     def add_time(value)
       @live_time += value
-      @current_time += value
+    end
+
+    def add_blocker(proc)
+      @blocked_at = current_time
+      @blockers << proc
+    end
+
+    def finished?
+      @current_command >= @commands_count
+    end
+
+    def not_finished?
+      !finished?
     end
 
     def pass_command?(number)
       @current_command > number
+    end
+
+    def current_time
+      @live_time + @start_time
+    end
+
+    def current_time=(value)
+      @live_time = value - @start_time
+    end
+
+    def blocked?
+      blocker = @blockers.detect{|b| !b.call}
+      if blocker.nil? # no active blocker
+        @blockers = []
+        false
+      else
+        true
+      end
+    end
+
+    def not_blocked?
+      !blocked?
     end
 
   end
@@ -257,6 +338,10 @@ class GPSS
     def enter
       @stored += 1
       @max_stored = @stored if @stored > @max_stored
+    end
+
+    def full?
+      @size == @stored
     end
 
     def leave
