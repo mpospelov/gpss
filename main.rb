@@ -1,7 +1,7 @@
 load "./gpss_interpreter.rb"
 require "byebug"
 
-GPSS.create_simulation(timer: 60000) do
+GPSS.create_simulation(timer: 6000) do
   storage size: 3, name: "S1_DEVICES"
   generate type: "normal_distribution", name: 1, mean: 115, std_dev: 30
   queue name: "LINE1"
