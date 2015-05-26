@@ -1,72 +1,191 @@
+require 'terminal-table'
+
 class GPSS
 
-  attr_accessor :storages, :generators, :queues, :transacts
+  attr_accessor :storages, :generators, 
+    :queues, :transacts, :devices, :queues_sizes
 
   class << self
 
     def create_simulation(timer:, &block)
       gpss = self.new(timer, &block)
       gpss.run
-      debugger
+      print_queues(gpss)
+      print_storages(gpss)
+      print_devices(gpss)
+      puts "1"
+    end
+
+    def print_queues(gpss)
+      averages = Hash[gpss.queues_sizes.map do |name, arr|
+        [name, arr.inject(0.0){|sum, el| sum + el}/arr.size]
+      end]
+      table = Terminal::Table.new title: "Queues", 
+        headings: [ "Name", "Max Size", "Average Size"], 
+        rows: gpss.queues.map{|name, q| [name, q.max_size, averages[name]] }
+      puts table
+      puts "\n"
+    end
+
+    def print_storages(gpss)
+      table = Terminal::Table.new title: "Storages", 
+        headings: [ "Name", "Max Stored"], 
+        rows: gpss.storages.map{|name, q| [name, q.max_stored] }
+      puts table
+      puts "\n"
+    end
+
+    def print_devices(gpss)
+      table = Terminal::Table.new title: "Devices", 
+        headings: [ "Name", "Max Size"], 
+        rows: gpss.devices.map{|name, q| [name, q.max_size] }
+      puts table
+      puts "\n"
     end
 
   end
 
   def initialize(timer, &block)
-    @timer = timer
     @simulation = Simulation.new
-    @simulation.add_future_event([1, timer, nil, 0])
-
+    @timer = timer
     @storages = {}
-    @generators = {}
     @queues = {}
+    @queues_sizes = {}
+    @devices = {}
     @transacts = []
 
-    @code = block
+    @random_generators = {}
+    @generators_finishes = {}
+    parser = CommandParser.new
+    parser.parse(&block)
+    @commands = parser.commands
   end
 
   def run
-    while current_time < @timer
-      instance_eval(&@code)
+    transacts_count = @transacts.length
+    commands_length = @commands.length
+    @transacts << Transact.new(time: 0, command: 0)
+    current_time = 0
+    while transact = next_transact
+      command_number = transact.current_command
+      command = @commands[command_number]
+      command_name = command[0]
+      command_args = command[1]
+      command_block = command[2]
+
+      @queues.each do |name, q|
+        @queues_sizes[name] ||= []
+        @queues_sizes[name] << q.size
+      end
+
+      send(command_name, transact, command_number, *command_args, &command_block)
+      transact.current_command += 1
     end
   end
 
-  def current_time
-    oldest_transact = @transacts.max_by(&:current_time)
-    if oldest_transact.nil?
-      0
-    else
-      oldest_transact.current_time
+  def next_transact
+    @transacts.sort_by!(&:current_time)
+    result = @transacts.first
+    if result.current_command != @commands.length
+      result
     end
   end
 
-  def storage(size:, name:)
+  def storage(transact, command_number, size:, name:)
     @storages[name] ||= Storage.new(size: size)
   end
 
-  def generate(type, attributes)
-    @generators[attributes[:name]] ||= RandomGenerator.send(type, attributes)
-    generator = @generators[attributes[:name]]
-    value = generator.next + current_time
-    @current_transact = Transact.new(time: value)
-    @transacts << @current_transact
-    @simulation.add_future_event([])
+  def generate(transact, command_number, attributes)
+    name = attributes[:name]
+    type = attributes[:type]
+    attributes.delete(:type)
+    if @generators_finishes[name].nil?
+      current_time = 0
+      while current_time < @timer
+        @random_generators[name] ||= RandomGenerator.send(type, attributes)
+        generator = @random_generators[name]
+        value = generator.next
+        current_time += value
+        @transacts << Transact.new(time: current_time, command: command_number)
+      end
+      @generators_finishes[name] = true
+    end
   end
 
-  def queue(name:)
+  def queue(transact, command_number, name:)
     @queues[name] ||= Queue.new
+    queue = @queues[name]
+    queue.enter
   end
 
-  def advance(type, attributes)
-    @generators[attributes[:name]] ||= RandomGenerator.send(type, attributes)
-    generator = @generators[attributes[:name]]
+  def advance(transact, command_number, attributes)
+    type = attributes[:type]
+    attributes.delete(:type)
+    @random_generators[attributes[:name]] ||= RandomGenerator.send(type, attributes)
+    generator = @random_generators[attributes[:name]]
     value = generator.next
-    @current_transact.add_time(value)
+    transact.add_time(value)
   end
 
-  def test(&block)
+  def test_condition(transact, command_number, &block)
   end
 
+  def enter(transact, command_number, name:)
+    @storages[name].enter
+  end
+
+  def depart(transact, command_number, name:)
+    @queues[name].depart
+  end
+
+  def leave(transact, command_number, name:)
+    @storages[name].enter
+  end
+
+  def seize(transact, command_number, name:)
+    @devices[name] ||= Device.new
+    @devices[name].seize(transact)
+  end
+
+  def release(transact, command_number, name:)
+    @devices[name].release(transact)
+  end
+
+  class CommandParser
+
+    attr_accessor :commands
+
+    def initialize
+      @commands = []
+    end
+
+    def parse(&block)
+      instance_eval(&block)
+    end
+
+    def method_missing(name, *args, &block)
+      @commands << [name, args, block]
+    end
+
+  end
+
+  class Device
+    attr_accessor :size, :max_size
+
+    def initialize
+      @size, @max_size = 0, 0
+    end
+
+    def seize(transact)
+      @size += 1
+      @max_size = @size if @size > @max_size
+    end
+
+    def release(transact)
+      @size -= 1
+    end
+
+  end
 
   class Simulation
 
@@ -84,11 +203,12 @@ class GPSS
 
   class Transact
 
-    attr_accessor :current_time, :live_time
+    attr_accessor :current_time, :live_time, :current_command
 
     @@max_index = 0
 
-    def initialize(time:)
+    def initialize(time:, command:)
+      @current_command = command
       @live_time = 0
       @index = @@max_index
       @@max_index += 1
@@ -99,6 +219,11 @@ class GPSS
       @live_time += value
       @current_time += value
     end
+
+    def pass_command?(number)
+      @current_command > number
+    end
+
   end
 
   class Queue
