@@ -130,8 +130,9 @@ class GPSS
 
   def next_transact
     select_from = @transacts.select(&:not_finished?).
-                             sort_by(&:current_time).
-                             sort_by(&:priority)
+                             sort_by(&:priority).
+                             sort_by(&:current_time)
+
     result = select_from.detect(&:not_blocked?)
     if !result.nil?
       select_from.each do |transact|

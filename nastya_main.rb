@@ -1,7 +1,7 @@
 load "./gpss_interpreter.rb"
 require "byebug"
 
-GPSS.create_simulation(timer: 4800) do
+GPSS.create_simulation(timer: 48000) do
   function name: "FTYPE" do
     val = rand
     if val < 0.22
